@@ -1,7 +1,0 @@
-{
-  "preset": 1,
-  "finest_scale": 1,
-  "patch_size": 8,
-  "patch_stride": 4,
-  "gd_iters": 25
-}
