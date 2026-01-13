@@ -1,0 +1,16 @@
+{
+  "disp_params": {
+    "sigma_small": 2.0,
+    "sigma_large": 18.0,
+    "gamma": 0.8,
+    "clip": 2.5
+  },
+  "disp_strength": 0.18,
+  "summary": {
+    "frames": 12,
+    "percent_diff_avg": 53.27124182383219,
+    "percent_diff_max": 58.29476547241211,
+    "ssim_avg": 0.26694657405217487,
+    "ssim_min": 0.15682360529899597
+  }
+}

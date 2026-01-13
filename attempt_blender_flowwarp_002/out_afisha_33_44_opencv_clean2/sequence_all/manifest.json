@@ -1,0 +1,58 @@
+[
+  {
+    "poster": "5.jpg",
+    "poster_stem": "5",
+    "frames_ref_start": 33,
+    "frames_ref_end": 44,
+    "sequence_start": 1,
+    "sequence_end": 12
+  },
+  {
+    "poster": "6.jpg",
+    "poster_stem": "6",
+    "frames_ref_start": 33,
+    "frames_ref_end": 44,
+    "sequence_start": 13,
+    "sequence_end": 24
+  },
+  {
+    "poster": "photo_2025-11-14_23-02-24.jpg",
+    "poster_stem": "photo_2025-11-14_23-02-24",
+    "frames_ref_start": 33,
+    "frames_ref_end": 44,
+    "sequence_start": 25,
+    "sequence_end": 36
+  },
+  {
+    "poster": "photo_2025-12-16_11-13-08.jpg",
+    "poster_stem": "photo_2025-12-16_11-13-08",
+    "frames_ref_start": 33,
+    "frames_ref_end": 44,
+    "sequence_start": 37,
+    "sequence_end": 48
+  },
+  {
+    "poster": "photo_2025-12-16_23-03-36.jpg",
+    "poster_stem": "photo_2025-12-16_23-03-36",
+    "frames_ref_start": 33,
+    "frames_ref_end": 44,
+    "sequence_start": 49,
+    "sequence_end": 60
+  },
+  {
+    "poster": "photo_2025-12-18_19-19-54.jpg",
+    "poster_stem": "photo_2025-12-18_19-19-54",
+    "frames_ref_start": 33,
+    "frames_ref_end": 44,
+    "sequence_start": 61,
+    "sequence_end": 72
+  },
+  {
+    "poster": "photo_2025-12-18_21-52-55.jpg",
+    "poster_stem": "photo_2025-12-18_21-52-55",
+    "frames_ref_start": 33,
+    "frames_ref_end": 44,
+    "sequence_start": 73,
+    "sequence_end": 84
+  }
+]
