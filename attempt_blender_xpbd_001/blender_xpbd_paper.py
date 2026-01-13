@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+import json
 
 import bpy
 
@@ -124,9 +125,10 @@ def build_sheet(aspect, nx, ny, size=2.0):
     bpy.ops.object.mode_set(mode="OBJECT")
 
     # Render smoother surface while keeping the simulation on the base mesh.
+    # Too much subsurf makes the sheet read like cloth. Keep it low for sharper paper folds.
     subsurf = obj.modifiers.new(name="Subsurf", type="SUBSURF")
-    subsurf.levels = 2
-    subsurf.render_levels = 2
+    subsurf.levels = 1
+    subsurf.render_levels = 1
     return obj
 
 
@@ -210,6 +212,7 @@ def main():
     frame_start = _as_int(args, "frame_start", 33)
     frame_end = _as_int(args, "frame_end", 44)
     fps = _as_float(args, "fps", 24.0)
+    dt_scale = _as_float(args, "dt_scale", 0.6)
 
     nx = _as_int(args, "nx", 35)
     ny = _as_int(args, "ny", 45)
@@ -217,15 +220,20 @@ def main():
 
     # XPBD parameters (tunable)
     pre_roll = _as_int(args, "pre_roll", 50)
-    substeps = _as_int(args, "substeps", 3)
+    substeps = _as_int(args, "substeps", 5)
     iters = _as_int(args, "iters", 8)
     attract0 = _as_float(args, "attract0", 12.0)
-    attract_tau = _as_float(args, "attract_tau", 0.06)
+    attract_tau = _as_float(args, "attract_tau", 0.25)
+    # Note: `unfold_alpha` is applied multiple times per frame (per solver iteration),
+    # so the effective pull-to-rest is much stronger than the raw value. Keep it small.
     unfold_max = _as_float(args, "unfold_max", 0.35)
-    unfold_power = _as_float(args, "unfold_power", 2.0)
-    crease_tau = _as_float(args, "crease_tau", 0.28)
+    unfold_power = _as_float(args, "unfold_power", 1.2)
+    unfold_gamma = _as_float(args, "unfold_gamma", 2.8)
+    crease_tau = _as_float(args, "crease_tau", 1.4)
+    unfold_delay = _as_float(args, "unfold_delay", 0.55)
     seed = _as_int(args, "seed", 7)
-    unlit_final_frames = _as_int(args, "unlit_final_frames", 2)
+    # Keep only the final frame fully unlit so frame_0044 ≈ poster, while 43 stays visibly different.
+    unlit_final_frames = _as_int(args, "unlit_final_frames", 1)
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -293,17 +301,47 @@ def main():
     v = [Vector((0.0, 0.0, 0.0)) for _ in rest]
     x = [p.copy() for p in rest]
 
-    # Create random crease targets by sampling hinges
-    crease_angle_rad = math.radians(110.0)
-    crease_targets = {}
-    for (i, j, k, l) in rnd.sample(hinges, min(len(hinges), 320)):
-        crease_targets[(i, j, k, l)] = rnd.choice([-1.0, 1.0]) * crease_angle_rad
+    # Small initial perturbation breaks symmetry (helps create center folds).
+    for i in range(len(x)):
+        x[i].y += rnd.uniform(-0.01, 0.01)
+        x[i].z += rnd.uniform(-0.01, 0.01)
 
-    stretch_stiffness = 0.95
-    hinge_stiffness = 0.7
-    hinge_max_correction_rad = math.radians(6.0)
-    damping = 0.15
-    gravity = -0.15
+    # Create crease targets; bias some through the center to match reference.
+    crease_angle_rad = math.radians(135.0)
+    crease_targets = {}
+    if hinges:
+        xs = [p.x for p in rest]
+        zs = [p.z for p in rest]
+        w = max(xs) - min(xs)
+        h = max(zs) - min(zs)
+        cx, cz = 0.5 * (max(xs) + min(xs)), 0.5 * (max(zs) + min(zs))
+
+        def hinge_mid(hg):
+            i, j, k, l = hg
+            p = (rest[i] + rest[j] + rest[k] + rest[l]) * 0.25
+            return p.x, p.z
+
+        center_hinges = []
+        other_hinges = []
+        for hg in hinges:
+            mx, mz = hinge_mid(hg)
+            if abs(mx - cx) < 0.16 * w and abs(mz - cz) < 0.16 * h:
+                center_hinges.append(hg)
+            else:
+                other_hinges.append(hg)
+
+        for hg in rnd.sample(center_hinges, min(len(center_hinges), 220)):
+            crease_targets[hg] = rnd.choice([-1.0, 1.0]) * crease_angle_rad
+        for hg in rnd.sample(other_hinges, min(len(other_hinges), 360)):
+            if hg not in crease_targets:
+                crease_targets[hg] = rnd.choice([-1.0, 1.0]) * crease_angle_rad
+
+    # Stiffer settings -> reads as paper/cardboard rather than cloth.
+    stretch_stiffness = 0.985
+    hinge_stiffness = 0.95
+    hinge_max_correction_rad = math.radians(10.0)
+    damping = 0.08
+    gravity = -0.12
 
     def dihedral(xi, xj, xk, xl):
         e = xj - xi
@@ -374,34 +412,64 @@ def main():
         for _ in range(n_iters):
             project_creases(crease_scale)
             project_edges()
-            project_unfold(unfold_alpha)
+        # Important: apply unfold only once per substep (not once per solver-iteration),
+        # otherwise the sheet converges to rest too fast and many late frames become near-identical.
+        project_unfold(unfold_alpha)
         for i in range(len(x)):
             v[i] = (x[i] - x_prev[i]) / max(1e-9, dt)
 
-    dt = 1.0 / fps / max(1, substeps)
+    dt = (1.0 / fps / max(1, substeps)) * max(0.1, min(2.0, dt_scale))
+
+    # Calibrate "full open" coverage in camera space so that target_area values normalized
+    # to the reference end-frame can be matched regardless of absolute framing.
+    def _apply_state():
+        for i, vert in enumerate(mesh.vertices):
+            vert.co = x[i]
+        mesh.update()
+        bpy.context.view_layer.update()
 
     # Pre-roll to reach a compact crumpled state by frame_start
+    # (paper is still at rest orientation before this loop).
+    area_flat = None
+    try:
+        area_flat = None
+        # At this moment x==rest (with tiny perturbations), so this is a close proxy for flat.
+        _apply_state()
+        # _area_fraction defined below; we set area_flat right after it exists.
+    except Exception:
+        area_flat = None
+
     for _ in range(max(0, pre_roll)):
         step(dt=dt, n_iters=iters, crease_scale=1.0, unfold_alpha=0.0, attract_strength=attract0)
 
+    def _smoothstep(x):
+        x = max(0.0, min(1.0, x))
+        return x * x * (3.0 - 2.0 * x)
+
     def schedule(frame):
+        # u=0 at frame_start (crumpled) -> u=1 at frame_end (flat)
         u = 0.0
         if frame_end > frame_start:
             u = (frame - frame_start) / (frame_end - frame_start)
         u = max(0.0, min(1.0, u))
-        unfold_alpha = unfold_max * (u**unfold_power)
+        # Optional delay (kept for experimentation; set unfold_delay=0 for smooth motion).
+        d = max(0.0, min(0.95, unfold_delay))
+        u2 = 0.0 if u <= d else (u - d) / max(1e-9, (1.0 - d))
+        # Use a power curve to slow early unfolding and keep expansion for later frames.
+        g = max(0.5, float(unfold_gamma))
+        s = max(0.0, min(1.0, u2)) ** g
+
+        # Drive the sheet back to rest continuously (avoid plateaus).
+        unfold_alpha = unfold_max * (s**unfold_power)
         unfold_alpha = max(0.0, min(0.95, unfold_alpha))
 
-        # Keep creases strong for most of the motion, then rapidly relax near the end.
-        if u < 0.85:
-            crease_scale = 1.0
-        else:
-            u2 = (u - 0.85) / 0.15
-            crease_scale = math.exp(-u2 / max(1e-6, crease_tau))
+        # Relax creases gradually across all frames (not only at the end).
+        crease_scale = math.exp(-s / max(1e-6, crease_tau))
         crease_scale = max(0.0, min(1.0, crease_scale))
 
-        attract = attract0 * math.exp(-u / max(1e-6, attract_tau))
-        if u > 0.92:
+        # Center attraction fades smoothly (keeps motion across the whole interval).
+        attract = attract0 * math.exp(-s / max(1e-6, attract_tau))
+        if u > 0.95:
             attract = 0.0
         return crease_scale, unfold_alpha, attract
 
@@ -411,27 +479,273 @@ def main():
     mat = sheet.active_material
     unlit_node = mat.node_tree.nodes.get("UNLIT_FACTOR") if mat else None
 
-    for f in range(frame_start, frame_end + 1):
-        crease_scale, unfold_alpha, attract = schedule(f)
-        for _ in range(max(1, substeps)):
-            step(dt=dt, n_iters=iters, crease_scale=crease_scale, unfold_alpha=unfold_alpha, attract_strength=attract)
-        if f == frame_end:
-            # Guarantee a perfectly flat end state.
+    target_area_path = _as_str(args, "target_area_path", "")
+    target_areas = None
+    if target_area_path and os.path.exists(target_area_path):
+        try:
+            raw = json.loads(open(target_area_path, "r", encoding="utf-8").read())
+            target_areas = {int(k): float(v) for k, v in raw.items()}
+        except Exception:
+            target_areas = None
+
+    def _area_fraction():
+        # Approximate visible area by rasterizing the union of projected triangles.
+        # This tracks the render alpha silhouette much better than a convex hull, and helps
+        # keep "paper coverage" monotonic across frames.
+        from bpy_extras.object_utils import world_to_camera_view
+
+        cam = scene.camera
+        mw = sheet.matrix_world
+        w = max(48, int(round(160 * (res_x / max(1.0, res_y)))))
+        h = 160
+
+        # Project vertices once.
+        proj = []
+        for vert in mesh.vertices:
+            uvw = world_to_camera_view(scene, cam, mw @ vert.co)
+            proj.append((float(uvw.x), float(uvw.y)))
+
+        mask = bytearray(w * h)
+
+        def clamp_int(v, lo, hi):
+            return lo if v < lo else hi if v > hi else v
+
+        for poly in mesh.polygons:
+            if poly.loop_total != 3:
+                continue
+            i0, i1, i2 = poly.vertices[:]
+            x0, y0 = proj[i0]
+            x1, y1 = proj[i1]
+            x2, y2 = proj[i2]
+
+            # Convert to pixel space (y-down).
+            px0, py0 = x0 * (w - 1), (1.0 - y0) * (h - 1)
+            px1, py1 = x1 * (w - 1), (1.0 - y1) * (h - 1)
+            px2, py2 = x2 * (w - 1), (1.0 - y2) * (h - 1)
+
+            minx = int(math.floor(min(px0, px1, px2)))
+            maxx = int(math.ceil(max(px0, px1, px2)))
+            miny = int(math.floor(min(py0, py1, py2)))
+            maxy = int(math.ceil(max(py0, py1, py2)))
+            if maxx < 0 or maxy < 0 or minx >= w or miny >= h:
+                continue
+            minx = clamp_int(minx, 0, w - 1)
+            maxx = clamp_int(maxx, 0, w - 1)
+            miny = clamp_int(miny, 0, h - 1)
+            maxy = clamp_int(maxy, 0, h - 1)
+
+            den = (py1 - py2) * (px0 - px2) + (px2 - px1) * (py0 - py2)
+            if abs(den) < 1e-9:
+                continue
+
+            for yy in range(miny, maxy + 1):
+                y = yy + 0.5
+                for xx in range(minx, maxx + 1):
+                    x = xx + 0.5
+                    w0 = ((py1 - py2) * (x - px2) + (px2 - px1) * (y - py2)) / den
+                    if w0 < 0.0:
+                        continue
+                    w1 = ((py2 - py0) * (x - px2) + (px0 - px2) * (y - py2)) / den
+                    if w1 < 0.0:
+                        continue
+                    w2 = 1.0 - w0 - w1
+                    if w2 < 0.0:
+                        continue
+                    mask[yy * w + xx] = 1
+
+        covered = sum(mask)
+        return float(covered / max(1, (w * h)))
+
+    # Now that _area_fraction exists, finalize area_flat calibration.
+    if area_flat is None:
+        try:
+            # Temporarily force a rest pose for calibration.
+            saved = [p.copy() for p in x]
             for i in range(len(x)):
                 x[i] = rest[i].copy()
-                v[i] = Vector((0.0, 0.0, 0.0))
-        if unlit_node is not None:
-            if f >= (frame_end - max(1, unlit_final_frames) + 1):
-                unlit_node.outputs[0].default_value = 1.0
+            _apply_state()
+            area_flat = max(1e-9, float(_area_fraction()))
+            for i in range(len(x)):
+                x[i] = saved[i].copy()
+            _apply_state()
+        except Exception:
+            area_flat = 1.0
+    else:
+        # area_flat placeholder created above; compute actual value.
+        try:
+            saved = [p.copy() for p in x]
+            for i in range(len(x)):
+                x[i] = rest[i].copy()
+            _apply_state()
+            area_flat = max(1e-9, float(_area_fraction()))
+            for i in range(len(x)):
+                x[i] = saved[i].copy()
+            _apply_state()
+        except Exception:
+            area_flat = 1.0
+
+    def _ctrl_from_s(s):
+        s = max(0.0, min(1.0, float(s)))
+        unfold_alpha = unfold_max * (s**unfold_power)
+        unfold_alpha = max(0.0, min(0.95, unfold_alpha))
+        crease_scale = math.exp(-s / max(1e-6, crease_tau))
+        crease_scale = max(0.0, min(1.0, crease_scale))
+        attract = attract0 * math.exp(-s / max(1e-6, attract_tau))
+        return crease_scale, unfold_alpha, attract
+
+    if target_areas is not None:
+        # Area-matched unfolding: advance the simulation sequentially and adjust a smooth
+        # control variable `s` until the coverage proxy matches the target curve.
+        # This prevents "4 keyframes + duplicates" by forcing perceptible change each frame.
+        _apply_state()
+        a_start = float(_area_fraction()) / max(1e-9, float(area_flat))
+
+        targets = []
+        last = a_start
+        raw0 = float(target_areas.get(frame_start, 0.0))
+        raw0 = max(0.0, min(1.0, raw0))
+        denom = max(1e-9, (1.0 - raw0))
+        min_step = 0.012  # minimum visible coverage change per frame (helps avoid accidental duplicates)
+        for f in range(frame_start, frame_end + 1):
+            raw = float(target_areas.get(f, 0.0))
+            raw = max(0.0, min(1.0, raw))
+            prog = max(0.0, min(1.0, (raw - raw0) / denom))
+            t = a_start + (1.0 - a_start) * prog
+            # Ensure monotonic and enforce a minimum step to keep every frame perceptibly different.
+            t = max(t, last + (0.0 if f == frame_start else min_step))
+            t = min(1.0, t)
+            last = t
+            targets.append((f, float(t)))
+
+        s_cur = 0.0
+        tol = 0.004
+        # Estimate current area ratio.
+        a_cur = float(_area_fraction()) / max(1e-9, float(area_flat))
+        a_prev = a_cur
+
+        for f in range(frame_start, frame_end + 1):
+            if f == frame_end:
+                # Guarantee a perfectly flat end state.
+                for i in range(len(x)):
+                    x[i] = rest[i].copy()
+                    v[i] = Vector((0.0, 0.0, 0.0))
+                _apply_state()
             else:
-                unlit_node.outputs[0].default_value = 0.0
-        for i, vert in enumerate(mesh.vertices):
-            vert.co = x[i]
-        mesh.update()
-        bpy.context.view_layer.update()
-        scene.frame_current = f
-        scene.render.filepath = os.path.join(out_dir, f"frame_{f:04d}.png")
-        bpy.ops.render.render(write_still=True)
+                target = dict(targets).get(f, 0.0)
+                target = max(0.0, min(1.0, float(target)))
+                # Enforce a strictly increasing "coverage" so the sequence reads as continuous unfolding.
+                target = max(target, a_prev + 0.001)
+
+                best_err = 1e9
+                best_state = None
+                best_area = None
+                best_under_err = None
+                best_under_state = None
+                best_under_area = None
+                best_over_err = None
+                best_over_state = None
+                best_over_area = None
+
+                max_iters = 220
+                for it in range(max_iters):
+                    # Stop when close enough and not shrinking vs previous frame.
+                    if a_cur >= (target - tol) and a_cur >= (a_prev - 1e-4):
+                        break
+                    err = float(target - a_cur)
+                    if err <= 0.0:
+                        # Already at/above target; do not force additional unfolding.
+                        break
+                    # Smoothly increase s based on remaining error (never decrease).
+                    ds = 0.001 + 0.06 * max(0.0, err)
+                    s_cur = min(1.0, s_cur + ds)
+
+                    crease_scale, unfold_alpha, attract = _ctrl_from_s(s_cur)
+                    # Prevent large jumps/overshoot near the target by scaling the "unfold pull"
+                    # with the remaining error.
+                    gain = max(0.15, min(1.0, err / 0.12))
+                    unfold_alpha = unfold_alpha * gain
+                    # Use *one* substep per control iteration to avoid large "snaps" that
+                    # skip over intermediate coverage states (causes duplicated frames).
+                    for _ in range(1):
+                        step(
+                            dt=dt,
+                            n_iters=iters,
+                            crease_scale=crease_scale,
+                            unfold_alpha=unfold_alpha,
+                            attract_strength=attract,
+                        )
+                    _apply_state()
+                    a_cur = float(_area_fraction()) / max(1e-9, float(area_flat))
+
+                    if a_cur >= (a_prev - 1e-4):
+                        if a_cur <= target:
+                            e = float(target - a_cur)
+                            if best_under_err is None or e < best_under_err:
+                                best_under_err = e
+                                best_under_area = a_cur
+                                best_under_state = [p.copy() for p in x]
+                        else:
+                            e = float(a_cur - target)
+                            if best_over_err is None or e < best_over_err:
+                                best_over_err = e
+                                best_over_area = a_cur
+                                best_over_state = [p.copy() for p in x]
+                        eabs = abs(a_cur - target)
+                        if eabs < best_err:
+                            best_err = eabs
+                            best_area = a_cur
+                            best_state = [p.copy() for p in x]
+                    # If we overshoot by a lot, stop early and use the best-so-far state.
+                    if a_cur >= target + 0.08:
+                        break
+
+                chosen_state = None
+                chosen_area = None
+                if best_under_state is not None:
+                    chosen_state = best_under_state
+                    chosen_area = best_under_area
+                elif best_over_state is not None:
+                    chosen_state = best_over_state
+                    chosen_area = best_over_area
+                else:
+                    chosen_state = best_state
+                    chosen_area = best_area
+
+                if chosen_state is not None:
+                    for i in range(len(x)):
+                        x[i] = chosen_state[i].copy()
+                    _apply_state()
+                    if chosen_area is not None:
+                        a_cur = float(chosen_area)
+                a_prev = a_cur
+
+            if unlit_node is not None:
+                if f >= (frame_end - max(1, unlit_final_frames) + 1):
+                    unlit_node.outputs[0].default_value = 1.0
+                else:
+                    unlit_node.outputs[0].default_value = 0.0
+            scene.frame_current = f
+            scene.render.filepath = os.path.join(out_dir, f"frame_{f:04d}.png")
+            bpy.ops.render.render(write_still=True)
+    else:
+        for f in range(frame_start, frame_end + 1):
+            crease_scale, unfold_alpha, attract = schedule(f)
+            for _ in range(max(1, substeps)):
+                step(dt=dt, n_iters=iters, crease_scale=crease_scale, unfold_alpha=unfold_alpha, attract_strength=attract)
+            if f == frame_end:
+                # Guarantee a perfectly flat end state.
+                for i in range(len(x)):
+                    x[i] = rest[i].copy()
+                    v[i] = Vector((0.0, 0.0, 0.0))
+            if unlit_node is not None:
+                if f >= (frame_end - max(1, unlit_final_frames) + 1):
+                    unlit_node.outputs[0].default_value = 1.0
+                else:
+                    unlit_node.outputs[0].default_value = 0.0
+            _apply_state()
+            scene.frame_current = f
+            scene.render.filepath = os.path.join(out_dir, f"frame_{f:04d}.png")
+            bpy.ops.render.render(write_still=True)
 
 
 if __name__ == "__main__":

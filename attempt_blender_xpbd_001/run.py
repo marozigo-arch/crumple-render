@@ -43,9 +43,11 @@ def clean_pause_bars(bgr: np.ndarray) -> np.ndarray:
     x0, x1 = int(w * 0.35), int(w * 0.65)
     y0, y1 = int(h * 0.35), int(h * 0.75)
     roi = gray[y0:y1, x0:x1]
+    roi_h, roi_w = roi.shape[:2]
     mu, sd = float(roi.mean()), float(roi.std())
-    th = mu + 0.7 * sd
-    mask_roi = (roi > th).astype(np.uint8) * 255
+    # Pause bars are near-white rectangles; use a conservative high threshold plus an adaptive one.
+    th = max(230.0, mu + 0.45 * sd)
+    mask_roi = ((roi >= 242) | (roi > th)).astype(np.uint8) * 255
     mask_roi = cv2.morphologyEx(
         mask_roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 7)), iterations=1
     )
@@ -57,8 +59,15 @@ def clean_pause_bars(bgr: np.ndarray) -> np.ndarray:
     for c in contours:
         rx, ry, rw, rh = cv2.boundingRect(c)
         area = rw * rh
-        if rh > 80 and rw < 80 and area > 2000:
-            rects.append((area, rx, ry, rw, rh))
+        if rh < int(roi_h * 0.18):
+            continue
+        if rw > int(roi_w * 0.25):
+            continue
+        if rh / max(1, rw) < 2.2:
+            continue
+        if area < 1200:
+            continue
+        rects.append((area, rx, ry, rw, rh))
     rects.sort(reverse=True)
     if len(rects) < 2:
         return bgr
@@ -105,6 +114,62 @@ def iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     union = float(np.logical_or(a, b).sum())
     return float(inter / union) if union > 0 else 0.0
 
+def compute_ref_area_targets(ref_dir: Path, frame_start: int, frame_end: int, time_warp_gamma: float = 1.0) -> dict[int, float]:
+    frames = list(range(frame_start, frame_end + 1))
+    areas = {}
+    for f in frames:
+        ref = clean_pause_bars(read_bgr(ref_dir / f"frame_{f:04d}.png"))
+        m = mask_from_reference_frame(ref)
+        areas[f] = float((m > 0).mean())
+    base = max(1e-9, areas[frame_end])
+    norm = {f: float(areas[f] / base) for f in frames}
+
+    # Build keyframes where the reference area actually changes, then interpolate between them
+    # to avoid plateaus (video needs perceptible motion every frame).
+    keys = [frame_start]
+    eps = 0.01
+    for f in frames[1:]:
+        if abs(norm[f] - norm[keys[-1]]) > eps:
+            keys.append(f)
+    if keys[-1] != frame_end:
+        keys.append(frame_end)
+
+    out_linear = {}
+    for a, b in zip(keys, keys[1:]):
+        va, vb = norm[a], norm[b]
+        span = b - a
+        for i, f in enumerate(range(a, b + 1)):
+            t = 0.0 if span == 0 else (i / span)
+            out_linear[f] = float((1.0 - t) * va + t * vb)
+    out_linear[frame_end] = 1.0
+
+    g = float(time_warp_gamma)
+    if g <= 1.001:
+        return out_linear
+
+    # Warp time so unfolding happens later (smooth, but avoids being "too open" by mid-frames).
+    def eval_at(t_frame: float) -> float:
+        tf = max(frame_start, min(frame_end, t_frame))
+        f0 = int(math.floor(tf))
+        f1 = min(frame_end, f0 + 1)
+        if f0 == f1:
+            return float(out_linear.get(f0, 0.0))
+        a0 = float(out_linear.get(f0, 0.0))
+        a1 = float(out_linear.get(f1, 0.0))
+        tt = tf - f0
+        return float((1.0 - tt) * a0 + tt * a1)
+
+    import math
+
+    out = {}
+    denom = max(1e-9, float(frame_end - frame_start))
+    for f in frames:
+        s = float(f - frame_start) / denom
+        s2 = s**g
+        tf = float(frame_start) + s2 * denom
+        out[f] = eval_at(tf)
+    out[frame_end] = 1.0
+    return out
 
 def make_poster_vs_frame44(poster_path: Path, frame44_path: Path, out_path: Path) -> None:
     poster = read_bgr(poster_path)
@@ -195,13 +260,29 @@ def make_compare_grid(ref_dir: Path, gen_dir: Path, frame_start: int, frame_end:
         h, w = img.shape[:2]
         return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-    ref_row = np.concatenate([resize(i) for i in ref_imgs], axis=1)
-    gen_row = np.concatenate([resize(i) for i in gen_imgs], axis=1)
+    def label(img, text):
+        out = img.copy()
+        cv2.putText(out, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(out, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 1, cv2.LINE_AA)
+        return out
+
+    ref_row = np.concatenate([label(resize(i), f"{f}") for i, f in zip(ref_imgs, frames)], axis=1)
+    gen_row = np.concatenate([label(resize(i), f"{f}") for i, f in zip(gen_imgs, frames)], axis=1)
     grid = np.concatenate([ref_row, gen_row], axis=0)
     ensure_dir(out_path.parent)
     cv2.imwrite(str(out_path), grid)
 
-def run_blender(poster_path: Path, out_frames_dir: Path, frame_start: int, frame_end: int, seed: int) -> None:
+def run_blender(
+    poster_path: Path,
+    out_frames_dir: Path,
+    frame_start: int,
+    frame_end: int,
+    seed: int,
+    unfold_delay: float,
+    unfold_gamma: float,
+    samples: int,
+    target_area_path: Optional[Path] = None,
+) -> None:
     script = Path(__file__).with_name("blender_xpbd_paper.py")
     cmd = [
         "blender",
@@ -218,10 +299,16 @@ def run_blender(poster_path: Path, out_frames_dir: Path, frame_start: int, frame
         str(frame_start),
         "--frame_end",
         str(frame_end),
+        "--unfold_delay",
+        str(float(unfold_delay)),
+        "--unfold_gamma",
+        str(float(unfold_gamma)),
+        "--target_area_path",
+        str(target_area_path) if target_area_path is not None else "",
         "--seed",
         str(seed),
         "--samples",
-        "48",
+        str(int(samples)),
     ]
     subprocess.check_call(cmd)
 
@@ -261,8 +348,13 @@ def main():
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--frame_start", type=int, default=33)
     ap.add_argument("--frame_end", type=int, default=44)
+    ap.add_argument("--unfold_delay", type=float, default=0.0, help="0..0.95, higher = unfold later (avoid for smooth motion)")
+    ap.add_argument("--unfold_gamma", type=float, default=2.8, help=">1 slows early unfolding, speeds late")
+    ap.add_argument("--samples", type=int, default=48, help="Cycles samples per frame")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--ref_dir", default="data/frames_ref")
+    ap.add_argument("--match_ref_area", action="store_true", help="Use reference area curve to time unfolding (smooth, no plateaus)")
+    ap.add_argument("--ref_time_warp_gamma", type=float, default=2.0, help=">1 slows early unfolding targets derived from reference")
     ap.add_argument("--max_posters", type=int, default=0)
     ap.add_argument("--make_cycle", action="store_true")
     ap.add_argument("--cycle_sample_n", type=int, default=0)
@@ -290,18 +382,32 @@ def main():
     seq_dir = out_dir / "sequence" / "frames"
     seq_index = 1
 
+    ref_targets: dict[int, float] | None = None
+    if args.match_ref_area and ref_dir.exists():
+        ref_targets = compute_ref_area_targets(ref_dir, args.frame_start, args.frame_end, time_warp_gamma=float(args.ref_time_warp_gamma))
+
     for idx, poster in enumerate(posters):
         poster_out = posters_root / poster.stem
         frames_rgba_out = poster_out / "frames_rgba"
         frames_out = poster_out / "frames"
         ensure_dir(frames_rgba_out)
         ensure_dir(frames_out)
+
+        target_path = None
+        if ref_targets is not None:
+            target_path = poster_out / "target_area.json"
+            target_path.write_text(json.dumps({str(k): v for k, v in ref_targets.items()}, indent=2), encoding="utf-8")
+
         run_blender(
             poster_path=poster,
             out_frames_dir=frames_rgba_out,
             frame_start=args.frame_start,
             frame_end=args.frame_end,
             seed=int(args.seed) + idx * 17,
+            unfold_delay=float(args.unfold_delay),
+            unfold_gamma=float(args.unfold_gamma),
+            samples=int(args.samples),
+            target_area_path=target_path,
         )
         # Composite RGBA renders onto a consistent dark background for convenient viewing,
         # while keeping the original RGBA frames in frames_rgba/.
@@ -331,7 +437,7 @@ def main():
                 frame_start=args.frame_start,
                 frame_end=args.frame_end,
                 out_path=poster_out / f"compare_grid_{args.frame_start}_{args.frame_end}.png",
-                scale=0.35,
+                scale=0.45,
             )
             # Compare silhouette similarity (IoU) as a texture-invariant metric.
             ious = {}
@@ -343,6 +449,30 @@ def main():
                 ious[str(f)] = iou(ref_mask, gen_mask)
             metrics["ref_mask_iou_per_frame"] = ious
             metrics["ref_mask_iou_avg"] = float(np.mean([ious[str(f)] for f in range(args.frame_start, args.frame_end + 1)]))
+
+            # Track per-frame motion in generated output (to catch accidental duplicates).
+            gen_rgba = [
+                cv2.imread(str(frames_rgba_out / f"frame_{f:04d}.png"), cv2.IMREAD_UNCHANGED)
+                for f in range(args.frame_start, args.frame_end + 1)
+            ]
+            # Track coverage growth (alpha area) to ensure a smooth multi-frame unfold.
+            alpha_area = {str(f): float((gen_rgba[i][:, :, 3] > 10).mean()) for i, f in enumerate(range(args.frame_start, args.frame_end + 1))}
+            base = max(1e-9, float(alpha_area[str(args.frame_end)]))
+            metrics["gen_alpha_area_norm_to_end"] = {k: float(v / base) for k, v in alpha_area.items()}
+            gen_mad = {}
+            for f0, f1, a, b in zip(
+                range(args.frame_start, args.frame_end),
+                range(args.frame_start + 1, args.frame_end + 1),
+                gen_rgba,
+                gen_rgba[1:],
+            ):
+                mask = (a[:, :, 3] > 10) & (b[:, :, 3] > 10)
+                if int(mask.sum()) < 50:
+                    d = 1.0
+                else:
+                    d = float(np.mean(np.abs(a[:, :, :3][mask].astype(np.float32) - b[:, :, :3][mask].astype(np.float32))) / 255.0)
+                gen_mad[f"{f0}->{f1}"] = d
+            metrics["gen_consecutive_mad_on_alpha"] = gen_mad
         (poster_out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
         if args.make_cycle:
