@@ -76,7 +76,7 @@ def setup_camera_and_light():
     cam = bpy.context.object
     bpy.context.scene.camera = cam
     cam.data.type = "ORTHO"
-    cam.data.ortho_scale = 2.1
+    cam.data.ortho_scale = 2.5  # Wider frame to prevent cropping of square/wide posters
 
     bpy.ops.object.empty_add(location=(0, 0, 0))
     target = bpy.context.object
@@ -87,13 +87,13 @@ def setup_camera_and_light():
     # Side-ish key light similar to reference
     bpy.ops.object.light_add(type="AREA", location=(-2.2, -2.4, 1.8))
     key = bpy.context.object
-    key.data.energy = 900
+    key.data.energy = 450  # Reduced to prevent overexposure on creases
     key.data.size = 1.6
     key.rotation_euler = (math.radians(65), math.radians(-10), math.radians(25))
 
     bpy.ops.object.light_add(type="AREA", location=(1.8, -2.8, 1.4))
     fill = bpy.context.object
-    fill.data.energy = 220
+    fill.data.energy = 150  # Reduced for balanced fill
     fill.data.size = 2.2
     fill.rotation_euler = (math.radians(70), math.radians(0), math.radians(-25))
 
@@ -625,10 +625,7 @@ def main():
 
         for f in range(frame_start, frame_end + 1):
             if f == frame_end:
-                # Guarantee a perfectly flat end state.
-                for i in range(len(x)):
-                    x[i] = rest[i].copy()
-                    v[i] = Vector((0.0, 0.0, 0.0))
+                # Let the simulation reach rest naturally. Frame-end should already be very close.
                 _apply_state()
             else:
                 target = dict(targets).get(f, 0.0)
@@ -720,10 +717,8 @@ def main():
                 a_prev = a_cur
 
             if unlit_node is not None:
-                if f >= (frame_end - max(1, unlit_final_frames) + 1):
-                    unlit_node.outputs[0].default_value = 1.0
-                else:
-                    unlit_node.outputs[0].default_value = 0.0
+                # Keep consistent shaded mode for all frames
+                unlit_node.outputs[0].default_value = 0.0
             scene.frame_current = f
             scene.render.filepath = os.path.join(out_dir, f"frame_{f:04d}.png")
             bpy.ops.render.render(write_still=True)
@@ -733,15 +728,11 @@ def main():
             for _ in range(max(1, substeps)):
                 step(dt=dt, n_iters=iters, crease_scale=crease_scale, unfold_alpha=unfold_alpha, attract_strength=attract)
             if f == frame_end:
-                # Guarantee a perfectly flat end state.
-                for i in range(len(x)):
-                    x[i] = rest[i].copy()
-                    v[i] = Vector((0.0, 0.0, 0.0))
+                # Let the simulation reach rest naturally. Frame-end should already be very close.
+                pass
             if unlit_node is not None:
-                if f >= (frame_end - max(1, unlit_final_frames) + 1):
-                    unlit_node.outputs[0].default_value = 1.0
-                else:
-                    unlit_node.outputs[0].default_value = 0.0
+                # Keep consistent shaded mode for all frames
+                unlit_node.outputs[0].default_value = 0.0
             _apply_state()
             scene.frame_current = f
             scene.render.filepath = os.path.join(out_dir, f"frame_{f:04d}.png")

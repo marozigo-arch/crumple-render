@@ -36,19 +36,51 @@ def write_bgr(path: Path, bgr: np.ndarray) -> None:
 def overlay_title(bgr: np.ndarray, title: str) -> np.ndarray:
     if not title:
         return bgr
-    out = bgr.copy()
-    h, w = out.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.8, min(1.35, w / 900.0))
-    thickness = 3
-    (tw, th), _ = cv2.getTextSize(title, font, scale, thickness)
+    from PIL import Image, ImageDraw, ImageFont
+    from pathlib import Path
+    
+    # Convert BGR to RGB for PIL
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil_img)
+    
+    h, w = bgr.shape[:2]
+    
+    # Use a truetype font that supports Cyrillic
+    font_size = int(max(48, min(80, w / 10.0)))
+    try:
+        # Common Linux paths for fonts with Cyrillic support
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        ]
+        font = None
+        for path in font_paths:
+            if Path(path).exists():
+                font = ImageFont.truetype(path, font_size)
+                break
+        if font is None:
+            font = ImageFont.load_default()
+    except:
+        font = ImageFont.load_default()
+    
+    # Get text bbox for centering
+    bbox = draw.textbbox((0, 0), title, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    
     x = int((w - tw) * 0.5)
     y = int(h * 0.12)
-    # shadow
-    cv2.putText(out, title, (x + 2, y + 2), font, scale, (0, 0, 0), thickness + 4, cv2.LINE_AA)
-    # main
-    cv2.putText(out, title, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
-    return out
+    
+    # Draw shadow
+    draw.text((x + 3, y + 3), title, font=font, fill=(0, 0, 0))
+    # Draw main text
+    draw.text((x, y), title, font=font, fill=(255, 255, 255))
+    
+    # Convert back to BGR
+    bgr_out = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    return bgr_out
 
 
 def blend(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
@@ -200,7 +232,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--afisha_dir", default="afisha")
     ap.add_argument("--out_dir", required=True)
-    ap.add_argument("--num_posters", type=int, default=3, help="How many posters to show (excluding cover)")
+    ap.add_argument("--num_posters", type=int, default=4, help="How many posters to show (excluding cover)")
     ap.add_argument("--cover_path", default="", help="Optional cover image; defaults to first poster")
     ap.add_argument("--title", default="Афиши", help="Title text for cover")
     ap.add_argument("--fps", type=int, default=24)
@@ -209,17 +241,17 @@ def main():
     ap.add_argument("--samples", type=int, default=24)
     ap.add_argument("--seed", type=int, default=7)
 
-    ap.add_argument("--unfold_len", type=int, default=18, help="Output frames for unfold per poster")
-    ap.add_argument("--fold_len", type=int, default=14, help="Output frames for fold per poster")
-    ap.add_argument("--hold_flat", type=int, default=18, help="Frames to hold fully unfolded poster")
-    ap.add_argument("--hold_ball", type=int, default=10, help="Frames to hold crumpled ball")
-    ap.add_argument("--cover_hold", type=int, default=8, help="Frames to show cover before crumpling")
-    ap.add_argument("--crossfade", type=int, default=6, help="Frames to crossfade between crumpled states")
+    ap.add_argument("--unfold_len", type=int, default=12, help="Output frames for unfold (should match frame_end - frame_start + 1)")
+    ap.add_argument("--fold_len", type=int, default=20, help="Output frames for fold")
+    ap.add_argument("--hold_flat", type=int, default=30, help="Frames to hold fully unfolded poster")
+    ap.add_argument("--hold_ball", type=int, default=2, help="Frames to hold crumpled ball")
+    ap.add_argument("--cover_hold", type=int, default=12, help="Frames to show cover before crumpling")
+    ap.add_argument("--crossfade", type=int, default=0, help="Frames to crossfade between crumpled states (0=disable to avoid ghosting)")
 
     ap.add_argument("--pair_duplicates", action="store_true", help="Repeat sampled indices (discrete look)")
     ap.add_argument("--frame_interp", action="store_true", default=True, help="Blend between base frames for smoother motion")
     ap.add_argument("--no_frame_interp", action="store_false", dest="frame_interp")
-    ap.add_argument("--different_fold", action="store_true", default=True, help="Use a different simulation for folding (same poster, different seed)")
+    ap.add_argument("--different_fold", action="store_true", default=False, help="Use a different simulation for folding (disabled for position continuity)")
     ap.add_argument("--same_fold", action="store_false", dest="different_fold")
 
     ap.add_argument("--ref_dir", default="data/frames_ref")
@@ -241,7 +273,8 @@ def main():
     n = max(1, int(args.num_posters))
     show_posters: list[Path] = []
     for i in range(n):
-        show_posters.append(posters[i % len(posters)])
+        # Start from index 1 to avoid duplicating cover (posters[0])
+        show_posters.append(posters[(i + 1) % len(posters)])
 
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
@@ -297,11 +330,11 @@ def main():
             stem_fold="cover" if not args.different_fold else "cover_fold",
             title=str(args.title),
             unfold_len=0,
-            fold_len=max(10, int(args.fold_len) + rnd.randint(-2, 3)),
-            hold_flat=max(1, int(args.cover_hold)),
-            hold_ball=max(0, int(args.hold_ball)),
-            easing_unfold="ease_in_out_cubic",
-            easing_fold=rnd.choice(easing_choices),
+            fold_len=24,  # longer fold for cover to avoid duplicates
+            hold_flat=int(args.cover_hold),
+            hold_ball=int(args.hold_ball),
+            easing_unfold="linear",  # 1:1 frame mapping
+            easing_fold="ease_out_quad",  # slower end, smoother collapse
         )
     )
     for i in range(1, n + 1):
@@ -315,12 +348,12 @@ def main():
                 stem_unfold=su,
                 stem_fold=sf,
                 title="",
-                unfold_len=max(12, int(args.unfold_len) + rnd.randint(-3, 4)),
-                fold_len=max(10, int(args.fold_len) + rnd.randint(-2, 3)),
-                hold_flat=max(0, int(args.hold_flat) + rnd.randint(-4, 6)),
-                hold_ball=max(0, int(args.hold_ball) + rnd.randint(-3, 4)),
-                easing_unfold=rnd.choice(easing_choices),
-                easing_fold=rnd.choice(easing_choices),
+                unfold_len=int(args.unfold_len) + 4,  # add extra frames for smoother unfold
+                fold_len=24,  # longer fold to avoid duplicates and smooth 8-9 transition
+                hold_flat=int(args.hold_flat),
+                hold_ball=int(args.hold_ball),
+                easing_unfold="ease_in_quad",  # gradual start, faster end
+                easing_fold="ease_out_quad",    # slower end, smoother collapse
             )
         )
 
