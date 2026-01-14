@@ -244,20 +244,25 @@ def main():
     # Note: setup_camera_and_light() will be called after building sheet
     bpy.context.scene.render.fps = int(round(fps))
 
-    aspect = res_x / res_y
+    # Always use RENDER aspect for paper, not poster aspect
+    # This ensures paper fits in fixed render frame (no cropping)
+    render_aspect = res_x / res_y  # 0.78 for 864×1104
+    
+    # Read poster image for texture, but don't use its aspect for paper dimensions
     if poster_path and os.path.exists(poster_path):
         try:
             img = bpy.data.images.load(poster_path)
-            if img and img.size[1] > 0:
-                aspect = img.size[0] / img.size[1]
+            # Poster aspect stored in image, will be used for texture mapping
+            # but paper dimensions are determined by render aspect only
         except Exception:
             pass
 
-    sheet = build_sheet(aspect=aspect, nx=nx, ny=ny, size=2.0)
+    # Create paper with RENDER aspect (always fits in frame)
+    sheet = build_sheet(aspect=render_aspect, nx=nx, ny=ny, size=2.0)
     apply_uv_map_xz(sheet)
     
     # Calculate actual paper dimensions for camera framing
-    paper_width = 2.0 * aspect
+    paper_width = 2.0 * render_aspect  # 1.56 for vertical render
     paper_height = 2.0
     
     # Setup camera with adaptive framing
