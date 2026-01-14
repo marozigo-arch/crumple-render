@@ -71,12 +71,13 @@ def setup_scene(res_x=864, res_y=1104, samples=64):
     bg.inputs[0].default_value = (0.02, 0.02, 0.02, 1)
 
 
-def setup_camera_and_light():
+def setup_camera_and_light(paper_width=2.0, paper_height=2.0):
     bpy.ops.object.camera_add(location=(0, -3.0, 0.05))
     cam = bpy.context.object
     bpy.context.scene.camera = cam
     cam.data.type = "ORTHO"
-    cam.data.ortho_scale = 2.5  # Wider frame to prevent cropping of square/wide posters
+    # Adaptive ortho scale: fit paper with 15% margin
+    cam.data.ortho_scale = max(paper_width, paper_height) * 1.15
 
     bpy.ops.object.empty_add(location=(0, 0, 0))
     target = bpy.context.object
@@ -240,7 +241,7 @@ def main():
     res_x = _as_int(args, "res_x", 864)
     res_y = _as_int(args, "res_y", 1104)
     setup_scene(res_x=res_x, res_y=res_y, samples=samples)
-    setup_camera_and_light()
+    # Note: setup_camera_and_light() will be called after building sheet
     bpy.context.scene.render.fps = int(round(fps))
 
     aspect = res_x / res_y
@@ -254,6 +255,14 @@ def main():
 
     sheet = build_sheet(aspect=aspect, nx=nx, ny=ny, size=2.0)
     apply_uv_map_xz(sheet)
+    
+    # Calculate actual paper dimensions for camera framing
+    paper_width = 2.0 * aspect
+    paper_height = 2.0
+    
+    # Setup camera with adaptive framing
+    setup_camera_and_light(paper_width=paper_width, paper_height=paper_height)
+    
     apply_two_sided_paper_material(sheet, image_path=poster_path if poster_path else "")
     bpy.ops.object.shade_smooth()
 
